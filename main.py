@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+import logging
 import os
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String
@@ -5,8 +7,10 @@ from sqlalchemy.orm import declarative_base, Session
 from pydantic import BaseModel
 
 DATABASE_URL = os.environ["DATABASE_URL"]
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, connect_args={"connect_timeout": 5})
 Base = declarative_base()
 
 # 테이블 모델(테이블 이름을 users)
@@ -21,17 +25,30 @@ class UserCreate(BaseModel):
     email: str
 
 # 테이블이 없으면 생성
-Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.database_ready = False
+    try:
+        Base.metadata.create_all(bind=engine)
+        app.state.database_ready = True
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Database connection failed. Check DATABASE_URL in .env. API docs remain available."
+        )
+    yield
+    engine.dispose()
 
 # 요청마다 세션을 열고, 끝나면 닫는 함수
 def get_db():
+    if not app.state.database_ready:
+        raise HTTPException(status_code=503, detail="Database unavailable. Check DATABASE_URL in .env and restart the server.")
     db = Session(bind=engine)
     try: 
         yield db
     finally:
         db.close()
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # C:Create 회원가입
 @app.post("/users")
